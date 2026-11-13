@@ -1,0 +1,6 @@
+{
+  "name": "오픈 익명 게시판",
+  "description": "익명 ID와 본문을 입력해 실시간으로 게시글을 공유하는 미니멀 익명 게시판 웹 애플리케이션",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
