@@ -55,3 +55,10 @@ exception
   when duplicate_object then null;
 end
 $$;
+
+-- Sync id sequence with max(id) to prevent duplicate primary key errors
+select setval(
+  pg_get_serial_sequence('public.posts', 'id'),
+  coalesce((select max(id) from public.posts), 0) + 1,
+  false
+);

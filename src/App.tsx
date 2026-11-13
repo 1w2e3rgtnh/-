@@ -294,7 +294,7 @@ export default function App() {
     try {
       const client = await resolveSupabase();
       if (client) {
-        const { data, error: insertError } = await client
+        let { data, error: insertError } = await client
           .from('posts')
           .insert({
             anonymous_id: trimmedId,
@@ -304,6 +304,37 @@ export default function App() {
           })
           .select('id, anonymous_id, content, likes, author_token, created_at')
           .single();
+
+        if (
+          insertError &&
+          (insertError.code === '23505' || insertError.message.includes('posts_pkey'))
+        ) {
+          for (let retry = 0; retry < 3; retry += 1) {
+            const { data: latestRow } = await client
+              .from('posts')
+              .select('id')
+              .order('id', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            const nextId = ((latestRow as { id?: number } | null)?.id ?? 0) + 1 + retry;
+            const retried = await client
+              .from('posts')
+              .insert({
+                id: nextId,
+                anonymous_id: trimmedId,
+                content: trimmedContent,
+                likes: 0,
+                author_token: authorToken,
+              })
+              .select('id, anonymous_id, content, likes, author_token, created_at')
+              .single();
+
+            data = retried.data;
+            insertError = retried.error;
+            if (!insertError && data) break;
+          }
+        }
 
         if (insertError || !data) {
           setError(

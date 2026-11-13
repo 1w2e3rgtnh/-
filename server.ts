@@ -232,7 +232,7 @@ async function createPost(
 ): Promise<StoredPost> {
   const client = getSupabaseClient();
   if (client) {
-    const { data, error } = await client
+    let { data, error } = await client
       .from('posts')
       .insert({
         anonymous_id: anonymousId,
@@ -242,6 +242,34 @@ async function createPost(
       })
       .select('id, anonymous_id, content, likes, author_token, created_at')
       .single();
+
+    if (error && (error.code === '23505' || error.message.includes('posts_pkey'))) {
+      for (let retry = 0; retry < 3; retry += 1) {
+        const { data: latestRow } = await client
+          .from('posts')
+          .select('id')
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextId = ((latestRow as { id?: number } | null)?.id ?? 0) + 1 + retry;
+        const retried = await client
+          .from('posts')
+          .insert({
+            id: nextId,
+            anonymous_id: anonymousId,
+            content,
+            likes: 0,
+            author_token: authorToken ?? null,
+          })
+          .select('id, anonymous_id, content, likes, author_token, created_at')
+          .single();
+
+        data = retried.data;
+        error = retried.error;
+        if (!error && data) break;
+      }
+    }
 
     if (error || !data) {
       throw new Error(error?.message || '게시글 저장에 실패했습니다.');

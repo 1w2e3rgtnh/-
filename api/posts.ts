@@ -110,7 +110,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('posts')
       .insert({
         anonymous_id: rawId,
@@ -120,6 +120,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       })
       .select('id, anonymous_id, content, likes, author_token, created_at')
       .single();
+
+    if (error && (error.code === '23505' || error.message.includes('posts_pkey'))) {
+      for (let retry = 0; retry < 3; retry += 1) {
+        const { data: latestRow } = await supabase
+          .from('posts')
+          .select('id')
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextId = ((latestRow as { id?: number } | null)?.id ?? 0) + 1 + retry;
+        const retried = await supabase
+          .from('posts')
+          .insert({
+            id: nextId,
+            anonymous_id: rawId,
+            content: rawContent,
+            likes: 0,
+            author_token: viewerToken ?? null,
+          })
+          .select('id, anonymous_id, content, likes, author_token, created_at')
+          .single();
+
+        data = retried.data;
+        error = retried.error;
+        if (!error && data) break;
+      }
+    }
 
     if (error || !data) {
       res.status(500).json({ error: `Supabase 저장 오류: ${error?.message || '알 수 없는 오류'}` });
