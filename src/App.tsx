@@ -1,8 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { Header } from './components/Header';
 import { PostComposer } from './components/PostComposer';
 import { PostFeed } from './components/PostFeed';
+import { getBrowserSupabaseClient } from './lib/supabase';
 import type { Post, RealtimeEvent } from './types/post';
+
+interface SupabasePostRow {
+  id: number;
+  anonymous_id: string;
+  content: string;
+  likes: number;
+  author_token?: string | null;
+  created_at: string;
+}
 
 const AUTHOR_TOKEN_KEY = 'anon_board_author_token';
 const SAVED_ID_KEY = 'anon_board_anonymous_id';
@@ -42,6 +53,17 @@ function loadLikedPostIds(): Set<number> {
   return new Set();
 }
 
+function toPublicPost(row: SupabasePostRow, authorToken: string): Post {
+  return {
+    id: row.id,
+    anonymous_id: row.anonymous_id,
+    content: row.content,
+    likes: typeof row.likes === 'number' ? row.likes : 0,
+    created_at: row.created_at,
+    is_mine: Boolean(authorToken && row.author_token && row.author_token === authorToken),
+  };
+}
+
 export default function App() {
   const [authorToken] = useState<string>(() => getOrCreateAuthorToken());
   const [anonymousId, setAnonymousId] = useState<string>(() => {
@@ -58,6 +80,7 @@ export default function App() {
 
   const idInputRef = useRef<HTMLInputElement | null>(null);
   const contentInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const supabaseRef = useRef<SupabaseClient | null | undefined>(undefined);
 
   const handleChangeAnonymousId = (value: string) => {
     setAnonymousId(value);
@@ -72,18 +95,51 @@ export default function App() {
     handleChangeAnonymousId(generateRandomAnonymousId());
   };
 
+  const resolveSupabase = useCallback(async (): Promise<SupabaseClient | null> => {
+    if (supabaseRef.current !== undefined) {
+      return supabaseRef.current;
+    }
+    const client = await getBrowserSupabaseClient();
+    supabaseRef.current = client;
+    return client;
+  }, []);
+
   const fetchPosts = useCallback(async () => {
     setError(null);
     try {
+      const client = await resolveSupabase();
+      if (client) {
+        const { data, error: queryError } = await client
+          .from('posts')
+          .select('id, anonymous_id, content, likes, author_token, created_at')
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .limit(200);
+
+        if (queryError) {
+          throw new Error(`Supabase 조회 오류: ${queryError.message}`);
+        }
+
+        const rows = (data ?? []) as SupabasePostRow[];
+        setPosts(rows.map((row) => toPublicPost(row, authorToken)));
+        return;
+      }
+
       const response = await fetch('/api/posts', {
         headers: {
           'x-author-token': authorToken,
         },
       });
-      if (!response.ok) {
-        throw new Error('게시글 목록을 불러오는 데 실패했습니다.');
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(
+          '백엔드 API 응답이 올바르지 않습니다. Vercel 환경 변수(VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY) 설정을 확인해 주세요.'
+        );
       }
-      const data = (await response.json()) as { posts?: Post[] };
+      const data = (await response.json()) as { posts?: Post[]; error?: string };
+      if (!response.ok) {
+        throw new Error(data.error || '게시글 목록을 불러오는 데 실패했습니다.');
+      }
       setPosts(Array.isArray(data.posts) ? data.posts : []);
     } catch (err) {
       setError(
@@ -92,7 +148,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [authorToken]);
+  }, [authorToken, resolveSupabase]);
 
   useEffect(() => {
     void fetchPosts();
@@ -107,14 +163,16 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  // Real-time WebSocket subscription with idempotent state reconciliation
+  // Real-time subscription: native Supabase Realtime when configured, else /ws WebSocket
   useEffect(() => {
+    let unmounted = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    let unmounted = false;
     let attempts = 0;
+    let activeSupabaseClient: SupabaseClient | null = null;
+    let realtimeChannel: ReturnType<SupabaseClient['channel']> | null = null;
 
-    const connect = () => {
+    const connectWebSocket = () => {
       if (unmounted) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -157,12 +215,64 @@ export default function App() {
       ws.onclose = () => {
         if (unmounted) return;
         attempts += 1;
+        // Stop aggressive WS retries if backend does not support WS (e.g. serverless)
+        if (attempts > 3) return;
         const delay = Math.min(10000, 1000 * Math.pow(1.5, attempts));
-        reconnectTimer = window.setTimeout(connect, delay);
+        reconnectTimer = window.setTimeout(connectWebSocket, delay);
       };
     };
 
-    connect();
+    const initRealtime = async () => {
+      const client = await resolveSupabase();
+      if (unmounted) return;
+
+      if (client) {
+        activeSupabaseClient = client;
+        realtimeChannel = client
+          .channel('public:posts')
+          .on(
+            'postgres_changes',
+            { event: '*', schema: 'public', table: 'posts' },
+            (change) => {
+              if (change.eventType === 'INSERT' && change.new) {
+                const inserted = toPublicPost(
+                  change.new as SupabasePostRow,
+                  authorToken
+                );
+                setPosts((prev) => {
+                  if (prev.some((item) => item.id === inserted.id)) {
+                    return prev;
+                  }
+                  return [inserted, ...prev];
+                });
+              } else if (change.eventType === 'UPDATE' && change.new) {
+                const updated = toPublicPost(
+                  change.new as SupabasePostRow,
+                  authorToken
+                );
+                setPosts((prev) =>
+                  prev.map((item) =>
+                    item.id === updated.id
+                      ? { ...updated, is_mine: item.is_mine ?? updated.is_mine }
+                      : item
+                  )
+                );
+              } else if (change.eventType === 'DELETE' && change.old) {
+                const deletedId = (change.old as { id?: number }).id;
+                if (typeof deletedId === 'number') {
+                  setPosts((prev) => prev.filter((item) => item.id !== deletedId));
+                }
+              }
+            }
+          )
+          .subscribe();
+        return;
+      }
+
+      connectWebSocket();
+    };
+
+    void initRealtime();
 
     return () => {
       unmounted = true;
@@ -170,8 +280,11 @@ export default function App() {
         window.clearTimeout(reconnectTimer);
       }
       ws?.close();
+      if (activeSupabaseClient && realtimeChannel) {
+        void activeSupabaseClient.removeChannel(realtimeChannel);
+      }
     };
-  }, [fetchPosts]);
+  }, [authorToken, fetchPosts, resolveSupabase]);
 
   const handleSubmitPost = async (
     trimmedId: string,
@@ -179,6 +292,39 @@ export default function App() {
   ): Promise<boolean> => {
     setError(null);
     try {
+      const client = await resolveSupabase();
+      if (client) {
+        const { data, error: insertError } = await client
+          .from('posts')
+          .insert({
+            anonymous_id: trimmedId,
+            content: trimmedContent,
+            likes: 0,
+            author_token: authorToken,
+          })
+          .select('id, anonymous_id, content, likes, author_token, created_at')
+          .single();
+
+        if (insertError || !data) {
+          setError(
+            `게시글 등록 오류: ${insertError?.message || '데이터를 저장하지 못했습니다.'}`
+          );
+          return false;
+        }
+
+        const createdPost = toPublicPost(data as SupabasePostRow, authorToken);
+        setPosts((prev) => {
+          const existingIndex = prev.findIndex((item) => item.id === createdPost.id);
+          if (existingIndex !== -1) {
+            const next = [...prev];
+            next[existingIndex] = createdPost;
+            return next;
+          }
+          return [createdPost, ...prev];
+        });
+        return true;
+      }
+
       const response = await fetch('/api/posts', {
         method: 'POST',
         headers: {
@@ -190,6 +336,14 @@ export default function App() {
           content: trimmedContent,
         }),
       });
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        setError(
+          '서버 API에 연결할 수 없습니다. Vercel 환경 변수(VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY) 설정 후 다시 배포해 주세요.'
+        );
+        return false;
+      }
 
       const data = (await response.json()) as { post?: Post; error?: string };
       if (!response.ok || !data.post) {
@@ -242,6 +396,37 @@ export default function App() {
     );
 
     try {
+      const client = await resolveSupabase();
+      if (client) {
+        const { data: existing, error: fetchError } = await client
+          .from('posts')
+          .select('likes')
+          .eq('id', postId)
+          .single();
+
+        if (!fetchError && existing) {
+          const nextLikes = Math.max(0, (existing.likes ?? 0) + delta);
+          const { data: updated, error: updateError } = await client
+            .from('posts')
+            .update({ likes: nextLikes })
+            .eq('id', postId)
+            .select('id, anonymous_id, content, likes, author_token, created_at')
+            .single();
+
+          if (!updateError && updated) {
+            const normalized = toPublicPost(updated as SupabasePostRow, authorToken);
+            setPosts((prev) =>
+              prev.map((item) =>
+                item.id === normalized.id
+                  ? { ...normalized, is_mine: item.is_mine }
+                  : item
+              )
+            );
+          }
+        }
+        return;
+      }
+
       const response = await fetch(`/api/posts/${postId}/like`, {
         method: 'POST',
         headers: {
@@ -276,6 +461,22 @@ export default function App() {
 
   const handleDeletePost = async (postId: number) => {
     try {
+      const client = await resolveSupabase();
+      if (client) {
+        const { error: deleteError } = await client
+          .from('posts')
+          .delete()
+          .eq('id', postId)
+          .eq('author_token', authorToken);
+
+        if (deleteError) {
+          setError(`게시글 삭제 오류: ${deleteError.message}`);
+          return;
+        }
+        setPosts((prev) => prev.filter((item) => item.id !== postId));
+        return;
+      }
+
       const response = await fetch(`/api/posts/${postId}`, {
         method: 'DELETE',
         headers: {

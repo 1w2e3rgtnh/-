@@ -50,8 +50,20 @@ function readSupabaseCredentials(): { url: string; key: string } {
     // Ignore read errors
   }
 
-  const url = (fileEnv.SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
-  const key = (fileEnv.SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+  const url = (
+    fileEnv.VITE_SUPABASE_URL ||
+    fileEnv.SUPABASE_URL ||
+    process.env.VITE_SUPABASE_URL ||
+    process.env.SUPABASE_URL ||
+    ''
+  ).trim();
+  const key = (
+    fileEnv.VITE_SUPABASE_ANON_KEY ||
+    fileEnv.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    ''
+  ).trim();
   return { url, key };
 }
 
@@ -360,6 +372,17 @@ async function startServer() {
   if (initialClient) {
     attachRealtimeIfNeeded(initialClient);
   }
+
+  app.get('/api/config', (_req: Request, res: Response) => {
+    const { url, key } = readSupabaseCredentials();
+    const isValid =
+      Boolean(url && key) &&
+      (url.startsWith('https://') || url.startsWith('http://'));
+    res.json({
+      supabaseUrl: isValid ? url : '',
+      supabaseAnonKey: isValid ? key : '',
+    });
+  });
 
   app.get('/api/posts', async (req: Request, res: Response) => {
     try {
